@@ -1,0 +1,48 @@
+# realtime/config.yaml
+serial:
+  port: "/dev/ttyACM0"
+  baud: 2000000
+
+sampling:
+  emg_fs: 1000.0
+  imu_fs: 200.0
+  window_seconds: 0.5
+
+paths:
+  models_dir: "./models"
+  logs_dir: "./logs"
+
+model:
+  keras_h5: "lstm_state.h5"            # relative to models_dir
+  norm_np: "lstm_norm.npy"            # relative to models_dir
+
+mpc:
+  horizon_seconds: 0.8
+  B: -0.05
+  lambda_u: 0.01
+  lambda_du: 0.01
+  u_min: -1.0
+  u_max: 1.0
+
+safety:
+  control_limit_per_second: 10
+  emergency_stop_threshold: 0.8
+  emergency_stop_duration: 1.0
+  resume_threshold: 0.5
+  resume_duration: 2.0
+logging:
+  log_emg: true
+  log_imu: true
+  log_control: true
+  log_frequency_hz: 10
+  max_log_file_size_mb: 50
+  backup_count: 5
+debug:
+  enable_debug_mode: false
+  debug_log_file: "debug.log"         # relative to logs_dir
+  debug_level: "INFO"
+  simulate_serial_data: false
+  simulated_data_file: "simulated_data.csv"  # relative to logs_dir
+  simulate_real_time: true
+  simulation_speed_factor: 1.0
+  

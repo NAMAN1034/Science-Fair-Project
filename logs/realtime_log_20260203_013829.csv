@@ -1,0 +1,1 @@
+time_s,emg_rms,emg_env_mean,emg_centroid_hz,imu_amp_mean,imu_phase_last,imu_freq_hz,imu_peak_hz,emg_imu_corr,plv_emg_imu,tremor_power,tremor_prob,phase_pred,amp_pred,u_phase,u_mpc,u_rl,u_final,dopamine,reward,rpe,latency_ms,energy_j,emergency_active
