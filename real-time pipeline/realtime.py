@@ -173,6 +173,20 @@ DEFAULTS: Dict[str, Any] = {
         "emergency_stop_duration": 1.0,
         "resume_threshold": 0.5,
         "resume_duration": 2.0,
+        "watchdog_s": 0.2,
+        "ack_timeout_s": 0.05,
+        "ack_required": True,
+    },
+    "sensor_bounds": {
+        "emg": [-5000.0, 5000.0],
+        "gx": [-32768.0, 32767.0],
+        "gy": [-32768.0, 32767.0],
+        "gz": [-32768.0, 32767.0],
+    },
+    "stimulation": {
+        "freq_hz": {"base": 120.0, "range": 40.0},
+        "pulse_width_us": {"base": 200.0, "range": 150.0},
+        "burst_ms": {"base": 150.0, "range": 100.0},
     },
     "logging": {
         "log_frequency_hz": 10,
@@ -192,7 +206,14 @@ DEFAULTS: Dict[str, Any] = {
             "enabled": False,
             "port": "/dev/ttyACM0",
             "baud": 115200,
-            "format": "U,{u:.3f},{phase:.3f},{amp:.3f}\n",
+            "mode": "stim",  # stim|legacy
+            "format": "STIM,{freq_hz:.2f},{pulse_width_us:.2f},{burst_ms:.2f}\n",
+            "max_rate_hz": 100.0,
+            "stim_limits": {
+                "freq_hz": [1.0, 200.0],
+                "pulse_width_us": [10.0, 500.0],
+                "burst_ms": [1.0, 200.0],
+            },
         }
     },
     "hardware": {
@@ -457,13 +478,25 @@ class EWMA:
 # Serial IO
 # ---------------------------
 class SerialFrameReader(threading.Thread):
-    def __init__(self, port: str, baud: int, out_queue: "queue.Queue", stop_event: threading.Event, emg_fs: float):
+    def __init__(
+        self,
+        port: str,
+        baud: int,
+        out_queue: "queue.Queue",
+        stop_event: threading.Event,
+        emg_fs: float,
+        ack_event: Optional[threading.Event] = None,
+        ack_time_ref: Optional[Dict[str, float]] = None,
+    ):
         super().__init__(daemon=True)
         self.port = port
         self.baud = baud
         self.out_q = out_queue
         self.stop_event = stop_event
         self.dt_us = int(1e6 / emg_fs)
+        self.ack_event = ack_event
+        self.ack_time_ref = ack_time_ref
+        self.send_lock = threading.Lock()
         self.ser = None
         self._open()
 
@@ -475,6 +508,17 @@ class SerialFrameReader(threading.Thread):
         while not self.stop_event.is_set():
             try:
                 hdr = self.ser.read(3)
+                if hdr == b"ACK":
+                    # Read remainder of ACK line (if any) and signal
+                    try:
+                        _ = self.ser.readline()
+                    except Exception:
+                        pass
+                    if self.ack_event is not None:
+                        if self.ack_time_ref is not None:
+                            self.ack_time_ref["mono"] = time.monotonic()
+                        self.ack_event.set()
+                    continue
                 if hdr != FRAME_HEADER:
                     continue
                 ver_b = self.ser.read(1)
@@ -503,6 +547,23 @@ class SerialFrameReader(threading.Thread):
             except Exception as e:
                 LOG.warning("Serial read error: %s", e)
                 time.sleep(0.05)
+
+    def send_raw(self, msg: str) -> None:
+        if self.ser is None:
+            return
+        with self.send_lock:
+            try:
+                self.ser.write(msg.encode("utf-8"))
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        if self.ser is None:
+            return
+        try:
+            self.ser.close()
+        except Exception:
+            pass
 
 
 def load_simulated_csv(path: str) -> List[Tuple[float, float, float, float, float]]:
@@ -555,17 +616,102 @@ class ControlOutput:
         self.enabled = bool(cfg_get(cfg, "output.serial_control.enabled", False))
         self.port = cfg_get(cfg, "output.serial_control.port", "/dev/ttyACM0")
         self.baud = int(cfg_get(cfg, "output.serial_control.baud", 115200))
-        self.format = cfg_get(cfg, "output.serial_control.format", "U,{u:.3f}\n")
+        self.mode = cfg_get(cfg, "output.serial_control.mode", "stim")
+        self.format = cfg_get(cfg, "output.serial_control.format", "STIM,{freq_hz:.2f},{pulse_width_us:.2f},{burst_ms:.2f}\n")
+        self.max_rate_hz = float(cfg_get(cfg, "output.serial_control.max_rate_hz", 100.0))
+        self.min_interval = 1.0 / max(1.0, self.max_rate_hz)
+        self.last_send_mono = 0.0
+        self.ack_required = bool(cfg_get(cfg, "safety.ack_required", True))
+        self.ack_timeout_s = float(cfg_get(cfg, "safety.ack_timeout_s", 0.05))
+        self.ack_event: Optional[threading.Event] = None
+        self.ack_time_ref: Optional[Dict[str, float]] = None
+        self.stim_limits = cfg_get(cfg, "output.serial_control.stim_limits", {})
+        self.stim_base = cfg_get(cfg, "stimulation", {})
         self.ser = None
         if self.enabled:
             self.ser = serial.Serial(self.port, self.baud, timeout=0.2)
             LOG.info("Control output serial opened %s @ %d", self.port, self.baud)
 
-    def send(self, u: float, phase: float, amp: float) -> None:
+    def attach_ack(self, ack_event: threading.Event, ack_time_ref: Dict[str, float]) -> None:
+        self.ack_event = ack_event
+        self.ack_time_ref = ack_time_ref
+
+    def _clamp(self, name: str, value: float) -> float:
+        limits = self.stim_limits.get(name, None)
+        if not limits:
+            return value
+        return float(max(limits[0], min(limits[1], value)))
+
+    def _map_stim(self, u: float) -> Dict[str, float]:
+        # Map control action u in [-1,1] to stimulation parameters
+        intensity = 0.5 + 0.5 * float(np.clip(u, -1.0, 1.0))
+        freq_base = self.stim_base.get("freq_hz", {}).get("base", 120.0)
+        freq_rng = self.stim_base.get("freq_hz", {}).get("range", 40.0)
+        pw_base = self.stim_base.get("pulse_width_us", {}).get("base", 200.0)
+        pw_rng = self.stim_base.get("pulse_width_us", {}).get("range", 150.0)
+        burst_base = self.stim_base.get("burst_ms", {}).get("base", 150.0)
+        burst_rng = self.stim_base.get("burst_ms", {}).get("range", 100.0)
+
+        freq = self._clamp("freq_hz", freq_base + freq_rng * intensity)
+        pw = self._clamp("pulse_width_us", pw_base + pw_rng * intensity)
+        burst = self._clamp("burst_ms", burst_base + burst_rng * intensity)
+        return {"freq_hz": freq, "pulse_width_us": pw, "burst_ms": burst}
+
+    def send(self, u: float, phase: float, amp: float) -> bool:
+        if not self.enabled or self.ser is None:
+            return False
+        now = time.monotonic()
+        if now - self.last_send_mono < self.min_interval:
+            return False
+        self.last_send_mono = now
+        if self.ack_required and self.ack_event is not None:
+            self.ack_event.clear()
+
+        if self.mode == "stim":
+            stim = self._map_stim(u)
+            msg = self.format.format(
+                freq_hz=stim["freq_hz"],
+                pulse_width_us=stim["pulse_width_us"],
+                burst_ms=stim["burst_ms"],
+                u=u,
+                phase=phase,
+                amp=amp,
+            )
+        else:
+            msg = self.format.format(u=u, phase=phase, amp=amp)
+        try:
+            self.ser.write(msg.encode("utf-8"))
+        except Exception:
+            return False
+
+        if self.ack_required and self.ack_event is not None:
+            if not self.ack_event.wait(self.ack_timeout_s):
+                # Resend once then fail safe
+                try:
+                    self.ser.write(msg.encode("utf-8"))
+                except Exception:
+                    self.safe_disable()
+                    return False
+                if not self.ack_event.wait(self.ack_timeout_s):
+                    self.safe_disable()
+                    return False
+        return True
+
+    def safe_disable(self) -> None:
         if not self.enabled or self.ser is None:
             return
-        msg = self.format.format(u=u, phase=phase, amp=amp)
-        self.ser.write(msg.encode("utf-8"))
+        try:
+            self.ser.write(b"STIM,0,0,0\n")
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        if self.ser is None:
+            return
+        try:
+            self.ser.close()
+        except Exception:
+            pass
 
 
 # ---------------------------
@@ -811,6 +957,13 @@ class RealtimePipeline:
     def __init__(self, cfg: Dict[str, Any]):
         self.cfg = cfg
         self.stop_event = threading.Event()
+        self.watchdog_s = float(cfg_get(cfg, "safety.watchdog_s", 0.2))
+        self.last_packet_mono: Optional[float] = None
+        self.watchdog_tripped = False
+        self.ack_event = threading.Event()
+        self.ack_time_ref: Dict[str, float] = {"mono": 0.0}
+        self.reader: Optional[SerialFrameReader] = None
+        self.sensor_bounds = cfg_get(cfg, "sensor_bounds", {})
         self.sample_q: "queue.Queue" = __import__("queue").Queue(maxsize=4096)
 
         self.emg_fs = float(cfg_get(cfg, "sampling.emg_fs", 1000.0))
@@ -853,6 +1006,8 @@ class RealtimePipeline:
         self.dopamine = DopamineModel(cfg)
         self.rl = RLPolicy(cfg)
         self.output = ControlOutput(cfg)
+        if self.output.enabled:
+            self.output.attach_ack(self.ack_event, self.ack_time_ref)
 
         logs_dir = cfg_get(cfg, "paths.logs_dir", "./logs")
         os.makedirs(logs_dir, exist_ok=True)
@@ -862,6 +1017,11 @@ class RealtimePipeline:
         self.log_writer = csv.writer(self.log_f)
         self.log_writer.writerow([
             "time_s",
+            "sensor_rx_ts",
+            "inference_done_ts",
+            "command_send_ts",
+            "ack_rx_ts",
+            "end_to_end_latency_ms",
             "emg_rms",
             "emg_env_mean",
             "emg_centroid_hz",
@@ -908,11 +1068,26 @@ class RealtimePipeline:
 
     def close(self) -> None:
         try:
+            self.log_f.flush()
             self.log_f.close()
         except Exception:
             pass
         if self.rl.save_path:
             self.rl.save(self.rl.save_path)
+        self.output.close()
+        if self.reader is not None:
+            self.reader.close()
+
+    def fail_safe_shutdown(self) -> None:
+        # Always attempt safe-disable before exit
+        try:
+            self.output.safe_disable()
+        except Exception:
+            pass
+        if self.reader is not None:
+            self.reader.send_raw("STIM,0,0,0\n")
+        self.stop_event.set()
+        self.close()
 
     def rotate_logs_if_needed(self) -> None:
         if self.log_f.tell() < self.max_log_bytes:
@@ -928,6 +1103,11 @@ class RealtimePipeline:
         self.log_writer = csv.writer(self.log_f)
         self.log_writer.writerow([
             "time_s",
+            "sensor_rx_ts",
+            "inference_done_ts",
+            "command_send_ts",
+            "ack_rx_ts",
+            "end_to_end_latency_ms",
             "emg_rms",
             "emg_env_mean",
             "emg_centroid_hz",
@@ -1141,6 +1321,16 @@ class RealtimePipeline:
         reward = w.get("amp", 1.0) * amp_reduction - w.get("energy", 0.4) * energy_j - w.get("latency", 0.2) * latency_penalty
         return float(reward)
 
+    def _valid_sample(self, emg: float, gx: float, gy: float, gz: float) -> bool:
+        # Reject NaN/inf/out-of-range sensor values before inference
+        if not (np.isfinite(emg) and np.isfinite(gx) and np.isfinite(gy) and np.isfinite(gz)):
+            return False
+        bounds = self.sensor_bounds
+        def _in_bounds(val: float, key: str) -> bool:
+            lo, hi = bounds.get(key, (-1e12, 1e12))
+            return lo <= val <= hi
+        return _in_bounds(emg, "emg") and _in_bounds(gx, "gx") and _in_bounds(gy, "gy") and _in_bounds(gz, "gz")
+
     def run(self) -> None:
         import queue  # local to avoid early import in constrained env
 
@@ -1159,111 +1349,147 @@ class RealtimePipeline:
                 float(cfg_get(self.cfg, "debug.simulation_speed_factor", 1.0)),
             )
         else:
-            reader = SerialFrameReader(
+            self.reader = SerialFrameReader(
                 cfg_get(self.cfg, "serial.port", "/dev/ttyACM0"),
                 int(cfg_get(self.cfg, "serial.baud", 2000000)),
                 self.sample_q,
                 self.stop_event,
                 self.emg_fs,
+                ack_event=self.ack_event,
+                ack_time_ref=self.ack_time_ref,
             )
+            reader = self.reader
         reader.start()
 
         LOG.info("Realtime pipeline started.")
+        next_control_mono = time.monotonic()
         while not self.stop_event.is_set():
+            t_s = None
             try:
-                t_us, emg_raw, gx, gy, gz = self.sample_q.get(timeout=0.5)
+                t_us, emg_raw, gx, gy, gz = self.sample_q.get(timeout=0.05)
             except queue.Empty:
+                t_us = emg_raw = gx = gy = gz = None
+
+            now_mono = time.monotonic()
+            if t_us is not None:
+                # Validate sample before using it
+                if self._valid_sample(float(emg_raw), float(gx), float(gy), float(gz)):
+                    self.last_packet_mono = now_mono
+                    t_s = t_us * 1e-6
+                    emg_v = (float(emg_raw) - self.adc_offset) * self.emg_lsb
+                    emg_bp = self.emg_filter.step(emg_v)
+                    emg_env = self.emg_env_filter.step(abs(emg_bp))
+                    self.emg_bp_buf.append(emg_bp)
+                    self.emg_env_buf.append(emg_env)
+
+                    if self.decimator.step():
+                        gx_s = float(gx) * self.gyro_scale
+                        gy_s = float(gy) * self.gyro_scale
+                        gz_s = float(gz) * self.gyro_scale
+                        self.axis_history["gx"].append(gx_s)
+                        self.axis_history["gy"].append(gy_s)
+                        self.axis_history["gz"].append(gz_s)
+                        self._select_axis_if_ready()
+                        imu_axis = {"gx": gx_s, "gy": gy_s, "gz": gz_s}[self.axis_selected]
+                        imu_bp = self.imu_filter.step(imu_axis)
+                        self.imu_buf.append(imu_bp)
+
+            # Watchdog: disable output if data stops
+            if self.last_packet_mono is None or (now_mono - self.last_packet_mono) > self.watchdog_s:
+                if not self.watchdog_tripped:
+                    self.output.safe_disable()
+                    if not self.output.enabled and self.reader is not None:
+                        self.reader.send_raw("STIM,0,0,0\n")
+                    self.watchdog_tripped = True
+                continue
+            if self.watchdog_tripped:
+                self.watchdog_tripped = False
+
+            # Deterministic control loop using monotonic time with jitter compensation
+            if now_mono < next_control_mono:
+                continue
+            while next_control_mono <= now_mono:
+                next_control_mono += self.control_dt
+
+            control_start = time.time()
+            emg_bp_win = self.emg_bp_buf.get()
+            emg_env_win = self.emg_env_buf.get()
+            imu_bp_win = self.imu_buf.get()
+            if len(emg_bp_win) < 8 or len(imu_bp_win) < 8:
                 continue
 
-            t_s = t_us * 1e-6
-            emg_v = (float(emg_raw) - self.adc_offset) * self.emg_lsb
-            emg_bp = self.emg_filter.step(emg_v)
-            emg_env = self.emg_env_filter.step(abs(emg_bp))
-            self.emg_bp_buf.append(emg_bp)
-            self.emg_env_buf.append(emg_env)
+            features = self._compute_features(emg_bp_win, emg_env_win, imu_bp_win)
+            signals = {
+                "emg_bp": emg_bp_win,
+                "emg_env": emg_env_win,
+                "imu_bp": imu_bp_win,
+                "imu_amp": np.abs(analytic_signal(imu_bp_win)),
+                "imu_phase": np.angle(analytic_signal(imu_bp_win)),
+            }
+            model_input = self._build_model_input(features, signals)
+            model_input = self.infer.apply_norm(model_input)
+            pred = self.infer.predict(model_input) if self.infer.model_path else None
+            inference_done_ts = time.monotonic()
+            pred_out = self._parse_model_outputs(pred)
 
-            if self.decimator.step():
-                gx_s = float(gx) * self.gyro_scale
-                gy_s = float(gy) * self.gyro_scale
-                gz_s = float(gz) * self.gyro_scale
-                self.axis_history["gx"].append(gx_s)
-                self.axis_history["gy"].append(gy_s)
-                self.axis_history["gz"].append(gz_s)
-                self._select_axis_if_ready()
-                imu_axis = {"gx": gx_s, "gy": gy_s, "gz": gz_s}[self.axis_selected]
-                imu_bp = self.imu_filter.step(imu_axis)
-                self.imu_buf.append(imu_bp)
+            tremor_prob = self._estimate_tremor_prob(features, pred_out)
+            phase_pred, amp_pred = self._predict_phase_amp(features, pred_out)
+            u_phase, u_mpc, u_final = self._compute_control(features, tremor_prob, phase_pred)
 
-            if self.last_control_t is None:
-                self.last_control_t = t_s
+            latency_ms = (time.time() - control_start) * 1000.0
+            energy_scale = cfg_get(self.cfg, "metrics.energy_scale", 0.06)
+            energy_j = energy_scale * (u_final ** 2) * self.control_dt
+            self.amp_baseline.update(features["imu_amp_mean"])
 
-            if t_s - self.last_control_t >= self.control_dt:
-                control_start = time.time()
-                self.last_control_t = t_s
-                emg_bp_win = self.emg_bp_buf.get()
-                emg_env_win = self.emg_env_buf.get()
-                imu_bp_win = self.imu_buf.get()
-                if len(emg_bp_win) < 8 or len(imu_bp_win) < 8:
-                    continue
+            reward = self._compute_reward(features["imu_amp_mean"], latency_ms, energy_j)
+            dopamine, rpe = self.dopamine.update(reward, self.control_dt)
+            self.rl.update(reward, rpe, dopamine)
 
-                features = self._compute_features(emg_bp_win, emg_env_win, imu_bp_win)
-                signals = {
-                    "emg_bp": emg_bp_win,
-                    "emg_env": emg_env_win,
-                    "imu_bp": imu_bp_win,
-                    "imu_amp": np.abs(analytic_signal(imu_bp_win)),
-                    "imu_phase": np.angle(analytic_signal(imu_bp_win)),
-                }
-                model_input = self._build_model_input(features, signals)
-                model_input = self.infer.apply_norm(model_input)
-                pred = self.infer.predict(model_input) if self.infer.model_path else None
-                pred_out = self._parse_model_outputs(pred)
+            u_safe, emergency = self.safety.apply(u_final, features["imu_amp_mean"], now_mono)
+            cmd_send_ts = time.monotonic()
+            ack_ok = self.output.send(u_safe, features["imu_phase_last"], features["imu_amp_mean"])
+            ack_ts = self.ack_time_ref.get("mono", 0.0) if ack_ok else 0.0
+            end_to_end_ms = 0.0
+            if self.last_packet_mono is not None:
+                if ack_ts and ack_ts > 0:
+                    end_to_end_ms = (ack_ts - self.last_packet_mono) * 1000.0
+                else:
+                    end_to_end_ms = (cmd_send_ts - self.last_packet_mono) * 1000.0
 
-                tremor_prob = self._estimate_tremor_prob(features, pred_out)
-                phase_pred, amp_pred = self._predict_phase_amp(features, pred_out)
-                u_phase, u_mpc, u_final = self._compute_control(features, tremor_prob, phase_pred)
-
-                latency_ms = (time.time() - control_start) * 1000.0
-                energy_scale = cfg_get(self.cfg, "metrics.energy_scale", 0.06)
-                energy_j = energy_scale * (u_final ** 2) * self.control_dt
-                baseline = self.amp_baseline.update(features["imu_amp_mean"])
-
-                reward = self._compute_reward(features["imu_amp_mean"], latency_ms, energy_j)
-                dopamine, rpe = self.dopamine.update(reward, self.control_dt)
-                self.rl.update(reward, rpe, dopamine)
-
-                u_safe, emergency = self.safety.apply(u_final, features["imu_amp_mean"], t_s)
-                self.output.send(u_safe, features["imu_phase_last"], features["imu_amp_mean"])
-
-                if t_s - self.log_last >= self.log_period:
-                    self.log_last = t_s
-                    self.log_writer.writerow([
-                        f"{t_s:.6f}",
-                        f"{features['emg_rms']:.6f}",
-                        f"{features['emg_env_mean']:.6f}",
-                        f"{features['emg_centroid_hz']:.4f}",
-                        f"{features['imu_amp_mean']:.6f}",
-                        f"{features['imu_phase_last']:.6f}",
-                        f"{features['imu_freq_hz']:.4f}",
-                        f"{features['imu_peak_hz']:.4f}",
-                        f"{features['emg_imu_corr']:.4f}",
-                        f"{features['plv_emg_imu']:.4f}",
-                        f"{features['tremor_power']:.6f}",
-                        f"{tremor_prob:.4f}",
-                        f"{phase_pred:.6f}",
-                        f"{amp_pred:.6f}",
-                        f"{u_phase:.6f}",
-                        f"{u_mpc:.6f}",
-                        f"{self.rl.prev_action if self.rl.enabled else 0.0:.6f}",
-                        f"{u_safe:.6f}",
-                        f"{dopamine:.4f}",
-                        f"{reward:.4f}",
-                        f"{rpe:.4f}",
-                        f"{latency_ms:.2f}",
-                        f"{energy_j:.6f}",
-                        int(emergency),
-                    ])
-                    self.rotate_logs_if_needed()
+            if time.time() - self.log_last >= self.log_period:
+                self.log_last = time.time()
+                self.log_writer.writerow([
+                    f"{t_s:.6f}" if t_s is not None else "",
+                    f"{self.last_packet_mono:.6f}" if self.last_packet_mono else "",
+                    f"{inference_done_ts:.6f}",
+                    f"{cmd_send_ts:.6f}",
+                    f"{ack_ts:.6f}" if ack_ts else "",
+                    f"{end_to_end_ms:.2f}",
+                    f"{features['emg_rms']:.6f}",
+                    f"{features['emg_env_mean']:.6f}",
+                    f"{features['emg_centroid_hz']:.4f}",
+                    f"{features['imu_amp_mean']:.6f}",
+                    f"{features['imu_phase_last']:.6f}",
+                    f"{features['imu_freq_hz']:.4f}",
+                    f"{features['imu_peak_hz']:.4f}",
+                    f"{features['emg_imu_corr']:.4f}",
+                    f"{features['plv_emg_imu']:.4f}",
+                    f"{features['tremor_power']:.6f}",
+                    f"{tremor_prob:.4f}",
+                    f"{phase_pred:.6f}",
+                    f"{amp_pred:.6f}",
+                    f"{u_phase:.6f}",
+                    f"{u_mpc:.6f}",
+                    f"{self.rl.prev_action if self.rl.enabled else 0.0:.6f}",
+                    f"{u_safe:.6f}",
+                    f"{dopamine:.4f}",
+                    f"{reward:.4f}",
+                    f"{rpe:.4f}",
+                    f"{latency_ms:.2f}",
+                    f"{energy_j:.6f}",
+                    int(emergency),
+                ])
+                self.rotate_logs_if_needed()
 
         self.close()
 
@@ -1302,7 +1528,7 @@ def main() -> None:
 
     def _sig_handler(signum, frame) -> None:
         LOG.info("Stopping (signal %s)", signum)
-        pipeline.stop_event.set()
+        pipeline.fail_safe_shutdown()
 
     signal.signal(signal.SIGINT, _sig_handler)
     signal.signal(signal.SIGTERM, _sig_handler)
@@ -1310,10 +1536,10 @@ def main() -> None:
     try:
         pipeline.run()
     except KeyboardInterrupt:
-        pipeline.stop_event.set()
+        pipeline.fail_safe_shutdown()
     except Exception as e:
         LOG.exception("Fatal error: %s", e)
-        pipeline.stop_event.set()
+        pipeline.fail_safe_shutdown()
 
 
 if __name__ == "__main__":
