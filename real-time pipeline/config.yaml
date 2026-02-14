@@ -30,6 +30,41 @@ safety:
   emergency_stop_duration: 1.0
   resume_threshold: 0.5
   resume_duration: 2.0
+  watchdog_s: 0.2
+  ack_timeout_s: 0.05
+  ack_required: true
+
+# Sensor sanity bounds (reject NaN/inf/out-of-range before inference)
+sensor_bounds:
+  emg: [-5000.0, 5000.0]
+  gx: [-32768.0, 32767.0]
+  gy: [-32768.0, 32767.0]
+  gz: [-32768.0, 32767.0]
+
+# Actuator mapping (control -> stimulation parameters)
+stimulation:
+  freq_hz:
+    base: 120.0
+    range: 40.0
+  pulse_width_us:
+    base: 200.0
+    range: 150.0
+  burst_ms:
+    base: 150.0
+    range: 100.0
+
+output:
+  serial_control:
+    enabled: false
+    port: "/dev/ttyACM0"
+    baud: 115200
+    mode: "stim"  # stim|legacy
+    format: "STIM,{freq_hz:.2f},{pulse_width_us:.2f},{burst_ms:.2f}\n"
+    max_rate_hz: 100.0
+    stim_limits:
+      freq_hz: [1.0, 200.0]
+      pulse_width_us: [10.0, 500.0]
+      burst_ms: [1.0, 200.0]
 logging:
   log_emg: true
   log_imu: true
